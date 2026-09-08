@@ -2,7 +2,7 @@ name: MOPH prices update
 
 on:
   schedule:
-    # 07:00 صباحاً بتوقيت بيروت صيفاً وشتاءً
+    # الساعة 7 صباحاً بتوقيت بيروت صيفاً وشتاءً
     - cron: "0 4 * * *"
     - cron: "0 5 * * *"
   workflow_dispatch:
@@ -34,10 +34,217 @@ jobs:
         working-directory: app/pharmacy-moph-app-v9
         run: node tools/check-beirut-time.mjs
 
-      - name: Download latest MOPH medicine prices
+      - name: Install Excel reader
+        if: steps.beirut.outputs.run == 'true'
+        run: |
+          python3 -m pip install --quiet xlrd==2.0.1
+
+      - name: Find latest official MOPH price file
+        if: steps.beirut.outputs.run == 'true'
+        id: moph
+        shell: bash
+        run: |
+          set -e
+          mkdir -p /tmp/moph
+          FOUND=""
+
+          for i in $(seq 0 120); do
+            FOLDER=$(TZ=Asia/Beirut date -d "-$i day" +"%-d-%-m-%Y")
+            FILEDATE=$(TZ=Asia/Beirut date -d "-$i day" +"%Y%m%d")
+
+            URL="https://www.moph.gov.lb/userfiles/files/HealthCareSystem/Pharmaceuticals/DrugsPublicPriceList/${FOLDER}/WebMarketed${FILEDATE}.xls"
+
+            echo "Trying MOPH file: ${FOLDER}"
+
+            if curl -fsSL \
+              --connect-timeout 10 \
+              --max-time 60 \
+              --retry 1 \
+              -A "Mozilla/5.0" \
+              "$URL" \
+              -o /tmp/moph/candidate.xls
+            then
+              SIZE=$(stat -c%s /tmp/moph/candidate.xls)
+
+              if [ "$SIZE" -gt 100000 ]; then
+                mv /tmp/moph/candidate.xls /tmp/moph/latest.xls
+                FOUND="yes"
+
+                echo "source_url=$URL" >> "$GITHUB_OUTPUT"
+                echo "source_date=$FOLDER" >> "$GITHUB_OUTPUT"
+
+                echo "Found latest MOPH file:"
+                echo "$URL"
+                break
+              fi
+            fi
+          done
+
+          if [ "$FOUND" != "yes" ]; then
+            echo "No recent MOPH Excel file was found."
+            exit 1
+          fi
+
+      - name: Convert MOPH Excel to pharmacy database
         if: steps.beirut.outputs.run == 'true'
         working-directory: app/pharmacy-moph-app-v9
-        run: npm run update-data
+        env:
+          MOPH_SOURCE_URL: ${{ steps.moph.outputs.source_url }}
+          MOPH_SOURCE_DATE: ${{ steps.moph.outputs.source_date }}
+        run: |
+          python3 - <<'PY'
+          import xlrd
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          excel_file = "/tmp/moph/latest.xls"
+          output_file = Path("public/data/drugs.json")
+
+          book = xlrd.open_workbook(excel_file)
+
+          def norm(value):
+              return " ".join(str(value or "").strip().lower().split())
+
+          def clean(value):
+              if value is None:
+                  return ""
+              if isinstance(value, float) and value.is_integer():
+                  return str(int(value))
+              return str(value).strip()
+
+          sheet = None
+          header_row = None
+          headers = None
+
+          for candidate in book.sheets():
+              for r in range(min(candidate.nrows, 30)):
+                  row_headers = [
+                      norm(candidate.cell_value(r, c))
+                      for c in range(candidate.ncols)
+                  ]
+
+                  if (
+                      "brand name" in row_headers
+                      and "strength" in row_headers
+                      and any(h.startswith("public price ll") for h in row_headers)
+                  ):
+                      sheet = candidate
+                      header_row = r
+                      headers = row_headers
+                      break
+
+              if sheet is not None:
+                  break
+
+          if sheet is None:
+              raise RuntimeError("Could not find MOPH medicine table in Excel file.")
+
+          def column_exact(name):
+              target = norm(name)
+              for i, h in enumerate(headers):
+                  if h == target:
+                      return i
+              return None
+
+          def column_prefix(prefix):
+              target = norm(prefix)
+              for i, h in enumerate(headers):
+                  if h.startswith(target):
+                      return i
+              return None
+
+          name_col = column_exact("Brand name")
+          strength_col = column_exact("Strength")
+          form_col = column_exact("Form")
+          price_col = column_prefix("Public Price LL")
+          code_col = column_exact("Code")
+          presentation_col = column_exact("Presentation")
+
+          if name_col is None or strength_col is None or price_col is None:
+              raise RuntimeError("Required columns are missing from MOPH Excel.")
+
+          rows = []
+
+          for r in range(header_row + 1, sheet.nrows):
+              name = clean(sheet.cell_value(r, name_col))
+
+              if not name:
+                  continue
+
+              strength = clean(sheet.cell_value(r, strength_col))
+
+              form = (
+                  clean(sheet.cell_value(r, form_col))
+                  if form_col is not None
+                  else ""
+              )
+
+              presentation = (
+                  clean(sheet.cell_value(r, presentation_col))
+                  if presentation_col is not None
+                  else ""
+              )
+
+              code = (
+                  clean(sheet.cell_value(r, code_col))
+                  if code_col is not None
+                  else ""
+              )
+
+              raw_price = sheet.cell_value(r, price_col)
+
+              try:
+                  price = int(round(float(raw_price)))
+                  if price <= 0:
+                      price = None
+              except Exception:
+                  price = None
+
+              rows.append({
+                  "atc": "",
+                  "name": name,
+                  "bg": "",
+                  "ingredients": "",
+                  "dosage": strength,
+                  "form": form,
+                  "price": price,
+                  "code": code,
+                  "presentation": presentation
+              })
+
+          rows.sort(
+              key=lambda x: (
+                  x["name"].lower(),
+                  x["dosage"].lower(),
+                  x["price"] if x["price"] is not None else 10**18
+              )
+          )
+
+          if len(rows) < 1000:
+              raise RuntimeError(
+                  f"MOPH database looks incomplete: only {len(rows)} rows"
+              )
+
+          payload = {
+              "source": "Lebanon Ministry of Public Health",
+              "sourceUrl": os.environ.get("MOPH_SOURCE_URL", ""),
+              "sourcePriceIndexDate": os.environ.get("MOPH_SOURCE_DATE", ""),
+              "synchronizedAt": datetime.now(timezone.utc).isoformat(),
+              "count": len(rows),
+              "rows": rows
+          }
+
+          output_file.parent.mkdir(parents=True, exist_ok=True)
+          output_file.write_text(
+              json.dumps(payload, ensure_ascii=False),
+              encoding="utf-8"
+          )
+
+          print(f"Medicines loaded: {len(rows)}")
+          print(f"MOPH price file date: {payload['sourcePriceIndexDate']}")
+          PY
 
       - name: Check medicine database
         if: steps.beirut.outputs.run == 'true'
@@ -45,6 +252,7 @@ jobs:
         run: |
           node - <<'NODE'
           const fs = require("fs");
+
           const data = JSON.parse(
             fs.readFileSync("public/data/drugs.json", "utf8")
           );
@@ -56,6 +264,7 @@ jobs:
           }
 
           console.log(`Medicines loaded: ${data.rows.length}`);
+          console.log(`MOPH file date: ${data.sourcePriceIndexDate}`);
           NODE
 
       - name: Deploy new prices to Netlify
@@ -66,5 +275,6 @@ jobs:
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
         run: |
           npx -y netlify-cli deploy --prod \
+            --dir=public \
             --site "$NETLIFY_SITE_ID" \
             --auth "$NETLIFY_AUTH_TOKEN"
