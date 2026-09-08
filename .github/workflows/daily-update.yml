@@ -1,0 +1,70 @@
+name: MOPH prices update
+
+on:
+  schedule:
+    # 07:00 صباحاً بتوقيت بيروت صيفاً وشتاءً
+    - cron: "0 4 * * *"
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Get repository
+        uses: actions/checkout@v4
+
+      - name: Unzip pharmacy program
+        run: |
+          mkdir -p app
+          unzip -q pharmacy-moph-app-v9.zip -d app
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Check Beirut time
+        id: beirut
+        working-directory: app/pharmacy-moph-app-v9
+        run: node tools/check-beirut-time.mjs
+
+      - name: Download latest MOPH medicine prices
+        if: steps.beirut.outputs.run == 'true'
+        working-directory: app/pharmacy-moph-app-v9
+        run: npm run update-data
+
+      - name: Check medicine database
+        if: steps.beirut.outputs.run == 'true'
+        working-directory: app/pharmacy-moph-app-v9
+        run: |
+          node - <<'NODE'
+          const fs = require("fs");
+          const data = JSON.parse(
+            fs.readFileSync("public/data/drugs.json", "utf8")
+          );
+
+          if (!Array.isArray(data.rows) || data.rows.length < 1000) {
+            throw new Error(
+              `Medicine database incomplete: ${data.rows?.length || 0}`
+            );
+          }
+
+          console.log(`Medicines loaded: ${data.rows.length}`);
+          NODE
+
+      - name: Deploy new prices to Netlify
+        if: steps.beirut.outputs.run == 'true'
+        working-directory: app/pharmacy-moph-app-v9
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: |
+          npx -y netlify-cli deploy --prod \
+            --site "$NETLIFY_SITE_ID" \
+            --auth "$NETLIFY_AUTH_TOKEN"
